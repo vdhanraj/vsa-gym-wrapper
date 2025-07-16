@@ -789,3 +789,72 @@ class Transformer(nn.Module):
             skip_index = skip_index + 1
 
         return output, None, None
+
+    def forward_rl_enc_dec(self, tokens: torch.Tensor, start_pos: int, curr_token=0, curr_pt="addition", base_forward_pass=False,
+                           curr_x=0, curr_y=0, curr_symbol=None, target=None, objects=None, verbose=False):
+
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+
+        # Shape of h is batch_size, token_number, hidden_dim
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1)
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        use_symbolic_layer = torch.tensor([True for _ in range(_bsz)], device=h.device).view(-1, 1).unsqueeze(-1) # Hard set this to true for this problem (always have intervention)
+
+        skip_index = 0 # Indicates which skip connection weight is being used (different ones for different layers if it's trainable)
+        for n, layer in enumerate(self.layers):
+            if n in self.symbolic_decoding_layers and not base_forward_pass:
+                relevant_h = h[:,-1,:]
+                context = self.encoders[n](relevant_h)
+
+                #print(h.shape)
+                final_symbol = curr_symbol.to(torch.bfloat16) + context.to(torch.bfloat16)
+                #print(final_symbol.shape)
+
+                modified_h = self.decoders[n](final_symbol)
+                #print(modified_h.shape)
+
+                h = torch.cat([h[:, :-1, :], torch.where(use_symbolic_layer, modified_h * (1 - self.skip_weights[skip_index]) + h[:, -1:, :] * self.skip_weights[skip_index], h[:, -1:, :])], dim=1) # Modify the last token
+                #print(h.shape)
+
+                skip_index = skip_index + 1
+
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+
+        n = n + 1
+
+        # Intervene after the final layer
+        if n in self.symbolic_decoding_layers and not base_forward_pass:
+            final_symbol = curr_symbol.to(torch.bfloat16)
+
+            modified_h = self.decoders[n](final_symbol)
+
+            h = torch.cat([h[:, :-1, :], torch.where(use_symbolic_layer, modified_h * (1 - self.skip_weights[skip_index]) + h[:, -1:, :] * self.skip_weights[skip_index], h[:, -1:, :])], dim=1) # Modify the last token
+
+            skip_index = skip_index + 1
+
+        n = n + 1
+        output = self.output(h).type_as(h)
+
+        # Intervene after the output projection layer 
+        if n in self.symbolic_decoding_layers and not base_forward_pass:
+            # Encode information corresponding to which token is currently being decoded
+            final_symbol = curr_symbol.to(torch.bfloat16)
+
+            modified_output = self.decoders[n](final_symbol)
+
+            output = torch.cat([output[:, :-1, :], torch.where(use_symbolic_layer, modified_output * (1 - self.skip_weights[skip_index]) + output[:, -1:, :] * self.skip_weights[skip_index], output[:, -1:, :])], dim=1) # Modify the last token
+
+            skip_index = skip_index + 1
+
+        return output, None, None
